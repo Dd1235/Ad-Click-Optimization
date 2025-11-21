@@ -135,11 +135,55 @@ So for each impression based on features, lets calculate a pCTR -> probability o
 
 The `Experiments.ipynb` file is provided by criteo, credits to them. Just downloaded it for my reference.
 
-## Optimization problem 1 summary
+## Easy_Problem_Final.ipynb notes
 
-- Worked with 50,000 impressions spread across 637 campaigns. After scaling the transformed costs, the total spend in this slice is ₹1.30 million equivalents, and we only allow ourselves to redeploy 10% of it (₹130,153) as the budget `B`.
-- Each impression decision is a variable `x_i` between 0 and 1. Zero means skip that impression, one means we fully buy it, and a fractional value says “if this impression type reappears, spend that fraction of the time.” This fractional relaxation mirrors the standard knapsack trick and keeps the problem convex and easy to solve.
-- A convex program that maximizes total predicted clicks `pCTR @ x` under the budget constraint allocates the entire ₹130k and returns an expected 11,277 clicks. A greedy fractional-knapsack rule that sorts impressions by pCTR-per-cost and fills the budget sequentially reaches 11,277 clicks as well, with a gap of only 6e-06 clicks, so the greedy intuition is perfectly aligned with the convex optimum for this linear objective.
-- Grouping the solution by campaign shows how skewed the inventory is. Campaign 7 alone contributes 3,177 impressions and 6.4% of historical cost, so even the unconstrained optimizer sends ₹9.4k (7.2% of the budget) its way, while hundreds of smaller campaigns receive pennies. This table is a practical way to explain the model to a business partner (“top 20 campaigns eat most of the spend; the tail gets almost nothing”).
-- To add simple fairness we give every campaign a minimum budget equal to 5% of its historical cost share and cap every campaign to at most 150% of its share with a hard upper limit of 8% of the total budget. With these constraints the solver still uses the entire ₹130k but the objective drops to 10,626 clicks, so we sacrifice about 651 clicks (~6%) to keep everyone in-bounds.
-- The fairness visualization confirms the story: campaign 7 is still the best performer but it is now clamped exactly at the 8% ceiling (₹10.4k). More than 300 campaigns hit their max cap, so the policy mostly throttles the densest campaigns, while 16 tiny campaigns sit on their minimum budgets to maintain exposure. This is the expected outcome when the dataset has a heavy head-and-tail distribution.
+- **Data/model prep:** Loaded 70k rows from the Criteo attribution TSV via DuckDB, engineered `day`/`hour`, clipped `click_pos`/`click_nb`, replaced `time_since_last_click = -1` with a large sentinel, treated `campaign` and `cat1..9` as categorical, then split 50k for training and 20k for allocation. Predicted probabilities for CTR/CVR with LightGBM (CTR AUC 0.706, logloss 0.579; CVR AUC 1.0, logloss 3.4e-8) and kept `pCTR`, `pCVR`, `cost`, `click`, `conversion`, plus a simple value proxy `density_cvr = pCVR/cost`.
+- **Sampling:** Most optimizations run on a 10-ad sample, scaled `cost` by 1e3 for readability, and set a daily impression pool of $$I = 200{,}000$$.
+
+### Problem 1.1 — maximize conversions, no caps
+
+- Decision weights $$w_i$$ represent the share of the daily impressions per ad. The objective is
+  $$\max_w \sum_i (pCTR_i \cdot pCVR_i) \, w_i \quad \text{s.t.} \quad \sum_i w_i = 1, \; w_i \ge 0.$$
+- Outcome: solver pushed $$w_2 \approx 0.997$$ to the top campaign (high $$pCTR$$ / low cost), giving a daily spend of about 1228 and ~0.0079 conversions. Observation: without any caps, everything collapses onto the single best ad.
+
+### Problem 1.2 — add hard caps on traffic share
+
+- Same objective as 1.1 with a per-ad ceiling $$w_i \le \text{cap}=0.4$$ plus the simplex constraint.
+- Outcome: weights spread (e.g., ads 2 and 8 take ~0.39 each, others 0.01–0.10). Spend rose to ~3190 with ~0.0060 conversions because some budget is forced into weaker ads. Cap prevents a single-ad monopoly but still rewards the high-CTR, low-cost ads.
+
+### Problem 1.3 — entropy regularization for exploration (no budget limit)
+
+- Added an entropy term to keep the allocation smooth:
+  $$\max_w \sum_i pCTR_i \, w_i + \gamma \sum_i w_i \log w_i \quad \text{s.t.} \quad \sum_i w_i = 1, \; 0 \le w_i \le \text{cap}.$$
+  (`cvxpy.entr` contributes $$- w_i \log w_i$$; positive $$\gamma$$ rewards spread.)
+- With $$\gamma = 0.7$$ and $$\text{cap} = 0.4$$, weights sat between 0.068–0.142 across all 10 ads. Expected daily spend ≈ ₹10{,}604, expected clicks ≈ 75{,}058, conversions ≈ 0.0031. Entropy smoothed the extreme spike from 1.1/1.2.
+- **Gamma sweep plots:** `plot_traffic_over_gamma` for $$\gamma \in \{0.1, 0.5, 0.9, 1.5, 4\}$$ showed the bars moving from sharp concentration (low $$\gamma$$) to nearly uniform (high $$\gamma$$) while respecting the cap.
+
+### Problem 1.4 — add budget and CPI floor
+
+- Cost per impression is $$cpi_i = pCTR_i \cdot CPC_i$$, and the budget should bind on spend, not just impressions. Very low $$pCTR_i$$ can make $$cpi_i \approx 0$$ and trick the solver into allocating those ads as “free.” To prevent that, a floor is used:
+  $$\tilde{cpi}_i = \max(cpi_i, 10^{-3}).$$
+- New decision variables are impression counts $$x_i$$ (not fractions). The problem:
+  $$
+  \\max_x \sum_i pCTR_i \, x_i \;+\; \gamma \sum_i x_i \log x_i \\
+  \\text{s.t. } x_i \ge 0,\; \sum_i x_i \le I,\; \sum_i \tilde{cpi}_i x_i \le B,\; x_i \le \text{cap} \cdot I.
+  $$
+  Here $$I = 200{,}000$$ impressions/day and $$B = 50{,}000$$ (with an optional cap on each $$x_i$$).
+- **Gamma sweep (with $$\tilde{cpi}$$):**
+  - $$\gamma = 0.0$$ → all ~200k impressions to ad 2, spend ₹1{,}205.99 (budget slack), clicks 120{,}172; pure exploitation.
+  - $$\gamma = 0.2$$ → spread a handful of impressions across all ads (spend ₹1.53, clicks 12.26).
+  - $$\gamma = 0.5$$ → spend ₹0.42, clicks 2.97.
+  - $$\gamma = 3.0$$ → near-uniform tiny allocations (spend ₹0.20, clicks 1.44).
+- **Observation:** The entropy term encourages spread; with the current “≤” constraints, large $$\gamma$$ also shrinks total impressions. Enforcing $$\sum_i x_i = I$$ would keep usage high while still smoothing the allocation. The CPI floor $$\tilde{cpi}$$ prevents zero-CTR ads from looking free and grabbing the budget.
+
+### Problem 1.5 — UCB for a single day (discarded)
+
+- Tried adding an exploration bonus (UCB proxy) for one-day allocation, but noted it is not meaningful for a single-shot optimization; kept code for reference only.
+
+### Problem 1.6 — UCB + entropy
+
+- Objective extended with an uncertainty bonus (higher when $$pCTR$$ is uncertain):
+  $$\\max_x \sum_i pCTR_i x_i + \gamma \sum_i x_i \log x_i + \gamma \beta \sum_i \text{uncertainty}_i x_i,$$
+  with the same spend and impression constraints as 1.4 and $$\text{uncertainty}_i = 1/\sqrt{pCTR_i}$$.
+- One-day sweeps: $$\gamma \in \{0, 0.5, 3\}$$ (with $$\beta = 0.5$$) showed the same pattern as 1.4—$$\gamma = 0$$ collapses to ad 2 (₹1{,}205.99, 120{,}172 clicks), higher $$\gamma$$ spreads traffic, lowers spend (₹0.90 → ₹0.45) and clicks (6.61 → 3.35).
+- **Multi-day UCB sim:** Built a synthetic 10-ad set (true CTRs 1–70%, with ad 2/3/5 boosted and ad 5 given a high CPC = 3). Ran over 15 days with $$I_{day} = 200$$, $$B_{day} = 100$$, $$\gamma = 0.5$$, $$\beta = 1.5$$. Plots track (a) daily impressions per ad and (b) the evolving CTR estimates. The UCB bonus keeps exploration early; estimates converge and traffic shifts toward the high-CTR ads while the budget constraint tempers the very expensive high-CTR option.
